@@ -1,4 +1,5 @@
-# bot.py  – Hydrate & Stretch Bot (channel-aware, bug-fixed)
+# bot.py – Hydrate & Stretch Bot
+# Cancels **all** reminders whenever the bot disconnects from Discord.
 
 import os
 import random
@@ -11,7 +12,7 @@ from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 # ──────────────────────────────────────────────────────────
-# 0.  Logging (helps when you debug on Replit / Render)
+# 0.  Logging
 # ──────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 
@@ -24,11 +25,63 @@ if not TOKEN:
     raise RuntimeError("Put DISCORD_TOKEN=… inside .env")
 
 intents = discord.Intents.default()
-intents.message_content = True          # also toggle in Dev-Portal
+intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ──────────────────────────────────────────────────────────
-# 2.  Remove default help → custom single-embed help
+# 2.  Helpers
+# ──────────────────────────────────────────────────────────
+def get_random_meme(folder: str) -> Optional[str]:
+    if not os.path.isdir(folder):
+        return None
+    files = [f for f in os.listdir(folder)
+             if os.path.isfile(os.path.join(folder, f))]
+    return os.path.join(folder, random.choice(files)) if files else None
+
+async def _cancel_loop(loop: tasks.Loop):
+    """Cancel a discord.ext.tasks.Loop and wait until it is shut down."""
+    loop.cancel()
+    try:
+        await loop._task                # type: ignore[attr-defined]
+    except asyncio.CancelledError:
+        pass
+
+# ──────────────────────────────────────────────────────────
+# 3.  Book-keeping  (user_id → (Loop, channel_id))
+# ──────────────────────────────────────────────────────────
+hydrate_tasks: Dict[int, Tuple[tasks.Loop, int]] = {}
+stretch_tasks: Dict[int, Tuple[tasks.Loop, int]] = {}
+
+async def purge_all_reminders():
+    """Stop every running reminder (called on disconnect)."""
+    logging.warning("Disconnect detected – purging all active reminders.")
+    # Copy keys so we can modify dicts while iterating
+    for uid in list(hydrate_tasks.keys()):
+        loop, _ = hydrate_tasks.pop(uid)
+        await _cancel_loop(loop)
+
+    for uid in list(stretch_tasks.keys()):
+        loop, _ = stretch_tasks.pop(uid)
+        await _cancel_loop(loop)
+
+# ──────────────────────────────────────────────────────────
+# 4.  Events
+# ──────────────────────────────────────────────────────────
+@bot.event
+async def on_ready():
+    print(f"{bot.user} is online ✅")
+
+@bot.event
+async def on_disconnect():
+    # Cannot await inside on_disconnect → schedule the purge task
+    asyncio.create_task(purge_all_reminders())
+
+@bot.event
+async def on_resumed():
+    logging.info("Reconnected to Discord gateway.")
+
+# ──────────────────────────────────────────────────────────
+# 5.  Custom help
 # ──────────────────────────────────────────────────────────
 bot.remove_command("help")
 
@@ -41,78 +94,57 @@ async def custom_help(ctx: commands.Context):
     )
     embed.add_field(
         name="!hydrate <minutes> [#channel]",
-        value="Start hydration reminders. If no channel is given, "
-              "the current channel is used.",
+        value="Start hydration reminders. Current channel is default.",
         inline=False)
-    embed.add_field(
-        name="!stophydrate",
-        value="Stop your hydration reminder.", inline=False)
+    embed.add_field(name="!stophydrate",
+                    value="Stop your hydration reminder.", inline=False)
     embed.add_field(
         name="!stretch <minutes> [#channel]",
         value="Start stretch reminders.", inline=False)
-    embed.add_field(
-        name="!stopstretch",
-        value="Stop your stretch reminder.", inline=False)
+    embed.add_field(name="!stopstretch",
+                    value="Stop your stretch reminder.", inline=False)
     embed.add_field(
         name="!stop / !stopall / !stopreminders",
         value="Stop **all** of your reminders.", inline=False)
-    embed.add_field(
-        name="Examples",
-        value="`!hydrate 30 #wellness`\n`!stretch 15`\n`!stop`",
-        inline=False)
     await ctx.send(embed=embed)
 
 # ──────────────────────────────────────────────────────────
-# 3.  Friendly error messages
+# 6.  Error handler
 # ──────────────────────────────────────────────────────────
 @bot.event
 async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     if isinstance(error, commands.CommandNotFound):
         await ctx.send("❓ Unknown command. Type `!help`.")
     elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(f"⚠️ Missing `{error.param.name}` argument. "
-                       "See `!help` for usage.")
+        await ctx.send(f"⚠️ Missing `{error.param.name}` argument. See `!help`.")
     elif isinstance(error, commands.BadArgument):
-        await ctx.send("⚠️ *minutes* must be a number; "
-                       "channel must be a valid text channel.")
+        await ctx.send("⚠️ *minutes* must be a number; channel must be valid.")
     else:
-        # Re-raise so the full traceback shows in console/logs
         raise error
 
 # ──────────────────────────────────────────────────────────
-# 4.  Helper – choose a random meme image
+# 7.  Core loop factory
 # ──────────────────────────────────────────────────────────
-def get_random_meme(folder: str) -> Optional[str]:
-    """Return a random file path from *folder*, or None if empty/missing."""
-    if not os.path.isdir(folder):
-        return None
-    files = [f for f in os.listdir(folder)
-             if os.path.isfile(os.path.join(folder, f))]
-    return os.path.join(folder, random.choice(files)) if files else None
+def make_reminder_loop(kind: str,
+                       minutes: int,
+                       channel: discord.TextChannel,
+                       mention: str):
+
+    images_dir = "memes" if kind == "hydrate" else "stretch"
+
+    @tasks.loop(minutes=minutes)
+    async def _loop():
+        meme = get_random_meme(images_dir)
+        content = f"{'💧' if kind == 'hydrate' else '🤸'} Time to {kind}, {mention}!"
+        if meme:
+            await channel.send(content, file=discord.File(meme))
+        else:
+            await channel.send(content)
+
+    return _loop
 
 # ──────────────────────────────────────────────────────────
-# 5.  Book-keeping (user_id → (Loop, channel_id))
-# ──────────────────────────────────────────────────────────
-hydrate_tasks: Dict[int, Tuple[tasks.Loop, int]] = {}
-stretch_tasks: Dict[int, Tuple[tasks.Loop, int]] = {}
-
-async def _cancel_loop(loop: tasks.Loop):
-    """Instantly cancel a discord.ext.tasks.Loop and wait for it to stop."""
-    loop.cancel()                       # ← interrupts even during sleep
-    try:
-        await loop._task                # type: ignore[attr-defined]
-    except asyncio.CancelledError:
-        pass
-
-# ──────────────────────────────────────────────────────────
-# 6.  on_ready
-# ──────────────────────────────────────────────────────────
-@bot.event
-async def on_ready():
-    print(f"{bot.user} is online ✅")
-
-# ──────────────────────────────────────────────────────────
-# 7.  Hydration commands
+# 8.  Hydration commands
 # ──────────────────────────────────────────────────────────
 @bot.command()
 async def hydrate(ctx: commands.Context,
@@ -121,7 +153,6 @@ async def hydrate(ctx: commands.Context,
     if minutes <= 0:
         return await ctx.send("⛔ Interval must be > 0 minutes.")
 
-    # Remove stale entry (e.g. after a restart)
     hydrate_tasks.pop(ctx.author.id, None)
 
     existing = hydrate_tasks.get(ctx.author.id)
@@ -130,18 +161,10 @@ async def hydrate(ctx: commands.Context,
                               "Use `!stophydrate` first.")
 
     channel = channel or ctx.channel
+    loop = make_reminder_loop("hydrate", minutes, channel, ctx.author.mention)
+    loop.start()
 
-    @tasks.loop(minutes=minutes)
-    async def hydration_loop():
-        meme = get_random_meme("memes")
-        if meme:
-            await channel.send(f"💧 Time to hydrate, {ctx.author.mention}!",
-                               file=discord.File(meme))
-        else:
-            await channel.send(f"💧 Time to hydrate, {ctx.author.mention}!")
-
-    hydration_loop.start()
-    hydrate_tasks[ctx.author.id] = (hydration_loop, channel.id)
+    hydrate_tasks[ctx.author.id] = (loop, channel.id)
     await ctx.send(f"💧 Hydration reminder every {minutes} min in {channel.mention}")
 
 @bot.command()
@@ -155,7 +178,7 @@ async def stophydrate(ctx: commands.Context):
         await ctx.send("⚠️ No active hydration reminder.")
 
 # ──────────────────────────────────────────────────────────
-# 8.  Stretch commands
+# 9.  Stretch commands
 # ──────────────────────────────────────────────────────────
 @bot.command()
 async def stretch(ctx: commands.Context,
@@ -172,18 +195,10 @@ async def stretch(ctx: commands.Context,
                               "Use `!stopstretch` first.")
 
     channel = channel or ctx.channel
+    loop = make_reminder_loop("stretch", minutes, channel, ctx.author.mention)
+    loop.start()
 
-    @tasks.loop(minutes=minutes)
-    async def stretch_loop():
-        meme = get_random_meme("stretch")
-        if meme:
-            await channel.send(f"🤸 Time to stretch, {ctx.author.mention}!",
-                               file=discord.File(meme))
-        else:
-            await channel.send(f"🤸 Time to stretch, {ctx.author.mention}!")
-
-    stretch_loop.start()
-    stretch_tasks[ctx.author.id] = (stretch_loop, channel.id)
+    stretch_tasks[ctx.author.id] = (loop, channel.id)
     await ctx.send(f"🤸 Stretch reminder every {minutes} min in {channel.mention}")
 
 @bot.command()
@@ -197,7 +212,7 @@ async def stopstretch(ctx: commands.Context):
         await ctx.send("⚠️ No active stretch reminder.")
 
 # ──────────────────────────────────────────────────────────
-# 9.  Stop ALL reminders
+# 10.  Stop ALL reminders
 # ──────────────────────────────────────────────────────────
 @bot.command(aliases=["stop", "stopall"])
 async def stopreminders(ctx: commands.Context):
@@ -221,6 +236,6 @@ async def stopreminders(ctx: commands.Context):
         await ctx.send("⚠️ You have no active reminders.")
 
 # ──────────────────────────────────────────────────────────
-# 10.  Run the bot
+# 11.  Run the bot
 # ──────────────────────────────────────────────────────────
 bot.run(TOKEN)
